@@ -12,7 +12,7 @@ import { renderVideo, trimAudioSilence } from '@/lib/video';
 export const maxDuration = 300; // 5 phút cho route này
 
 // Chạy pipeline không đồng bộ (client polling status)
-async function processPipeline(jobId: string, url: string) {
+async function processPipeline(jobId: string, url: string, voiceId?: string) {
   const outDir = path.join(process.cwd(), 'outputs', jobId);
 
   try {
@@ -33,7 +33,7 @@ async function processPipeline(jobId: string, url: string) {
     // Step 3: TTS
     advanceStep(jobId, 'tts', { step: 'Đang tạo giọng đọc...', progress: 45 });
     const audioPath = path.join(outDir, 'audio.mp3');
-    await generateAudio(script, audioPath);
+    await generateAudio(script, audioPath, voiceId);
     // Cắt silence trailing để video kết thúc đúng lúc voice xong.
     // trimAudioSilence trả về duration mới đã chính xác sau khi cắt.
     const duration = await trimAudioSilence(audioPath);
@@ -77,14 +77,14 @@ async function processPipeline(jobId: string, url: string) {
 export async function POST(request: Request) {
   pruneOldJobs();
 
-  let body: { url?: string };
+  let body: { url?: string; voice?: string };
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: 'Body JSON không hợp lệ' }, { status: 400 });
   }
 
-  const { url } = body;
+  const { url, voice } = body;
   if (!url || typeof url !== 'string') {
     return NextResponse.json({ error: 'Thiếu tham số url' }, { status: 400 });
   }
@@ -103,7 +103,7 @@ export async function POST(request: Request) {
   createJob(jobId, url);
 
   // Chạy pipeline bất đồng bộ (fire and forget)
-  void processPipeline(jobId, url);
+  void processPipeline(jobId, url, typeof voice === 'string' ? voice : undefined);
 
   return NextResponse.json({ jobId });
 }

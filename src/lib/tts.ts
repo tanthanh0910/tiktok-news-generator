@@ -46,7 +46,7 @@ function escapeSSML(s: string): string {
 // Có stall timeout để fail fast khi WebSocket treo (Microsoft đôi lúc giữ
 // connection mở mà không gửi data nào).
 // ─────────────────────────────────────────────────────────────────────────────
-async function generateEdgeTTS(text: string, outputPath: string): Promise<void> {
+async function generateEdgeTTS(text: string, outputPath: string, voice: string): Promise<void> {
   const tts = new MsEdgeTTS();
 
   // Bắt mọi unhandledRejection bubble ra từ ws/msedge-tts trong khoảng
@@ -57,7 +57,7 @@ async function generateEdgeTTS(text: string, outputPath: string): Promise<void> 
   process.on('unhandledRejection', rejectionHandler);
 
   try {
-    await tts.setMetadata(VOICE, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
   } catch (err) {
     process.off('unhandledRejection', rejectionHandler);
     throw new Error(`Edge TTS setMetadata fail: ${err instanceof Error ? err.message : String(err)}`);
@@ -194,23 +194,56 @@ async function generateGTTS(text: string, outputPath: string): Promise<void> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Voice catalog (UI dùng list này để render dropdown, server validate id)
+// ─────────────────────────────────────────────────────────────────────────────
+export interface VoiceOption {
+  id: string;
+  label: string;
+  provider: 'edge' | 'gtts';
+  /** Tên voice cho Edge TTS (chỉ áp dụng khi provider='edge') */
+  voice?: string;
+  gender?: 'female' | 'male';
+}
+
+export const VOICES: VoiceOption[] = [
+  { id: 'edge-hoaimy', label: 'Nữ - Hoài My', provider: 'edge', voice: 'vi-VN-HoaiMyNeural', gender: 'female' },
+  { id: 'edge-namminh', label: 'Nam - Nam Minh', provider: 'edge', voice: 'vi-VN-NamMinhNeural', gender: 'male' },
+  { id: 'gtts', label: 'Google (mặc định, ổn định)', provider: 'gtts' },
+];
+
+export const DEFAULT_VOICE_ID = VOICES[0].id;
+
+export function findVoice(id: string | undefined): VoiceOption {
+  return VOICES.find((v) => v.id === id) ?? VOICES[0];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
-export async function generateAudio(text: string, outputPath: string): Promise<void> {
+export async function generateAudio(
+  text: string,
+  outputPath: string,
+  voiceId?: string
+): Promise<void> {
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const cleaned = sanitizeScript(text);
   if (!cleaned) throw new Error('Script rỗng sau khi sanitize');
 
-  if (PROVIDER === 'gtts') {
+  // voiceId từ UI override env defaults. Không có → dùng env (TTS_PROVIDER + EDGE_TTS_VOICE).
+  const selected = voiceId ? findVoice(voiceId) : null;
+  const provider = selected?.provider ?? (PROVIDER as 'edge' | 'gtts');
+  const edgeVoice = selected?.voice ?? VOICE;
+
+  if (provider === 'gtts') {
     await generateGTTS(cleaned, outputPath);
     return;
   }
 
-  // Edge mặc định, fallback sang gTTS nếu treo/lỗi
+  // Edge — fallback sang gTTS nếu treo/lỗi
   try {
-    await generateEdgeTTS(cleaned, outputPath);
+    await generateEdgeTTS(cleaned, outputPath, edgeVoice);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[tts] Edge TTS thất bại (${msg}), fallback sang gTTS...`);

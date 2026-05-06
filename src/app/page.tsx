@@ -299,12 +299,21 @@ function UploadPanel({
 // ─────────────────────────────────────────────
 // Main Page
 // ─────────────────────────────────────────────
+interface VoiceMeta {
+  id: string;
+  label: string;
+  provider: 'edge' | 'gtts';
+  gender?: 'female' | 'male';
+}
+
 export default function Home() {
   const [url, setUrl] = useState('');
   const [job, setJob] = useState<JobState | null>(null);
   const [isGenerating, setIsGenerating] = useState(false);
   const [youtube, setYoutube] = useState<Platform>({ connected: null });
   const [tiktok, setTiktok] = useState<Platform>({ connected: null });
+  const [voices, setVoices] = useState<VoiceMeta[]>([]);
+  const [voiceId, setVoiceId] = useState<string>('');
   const [now, setNow] = useState(() => Date.now());
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -316,24 +325,28 @@ export default function Home() {
     return () => clearInterval(t);
   }, [job]);
 
-  // ── Check platform connections on mount ──
+  // ── Check platform connections + fetch voice list on mount ──
   useEffect(() => {
-    const checkPlatforms = async () => {
+    const init = async () => {
       try {
-        const [ytRes, ttRes] = await Promise.all([
+        const [ytRes, ttRes, voiceRes] = await Promise.all([
           fetch('/api/auth/youtube'),
           fetch('/api/auth/tiktok'),
+          fetch('/api/voices'),
         ]);
         const yt = await ytRes.json() as { connected: boolean; authUrl?: string };
         const tt = await ttRes.json() as { connected: boolean; authUrl?: string };
+        const vc = await voiceRes.json() as { voices: VoiceMeta[]; defaultVoice: string };
         setYoutube({ connected: yt.connected, authUrl: yt.authUrl });
         setTiktok({ connected: tt.connected, authUrl: tt.authUrl });
+        setVoices(vc.voices);
+        setVoiceId(vc.defaultVoice);
       } catch {
         setYoutube({ connected: false });
         setTiktok({ connected: false });
       }
     };
-    checkPlatforms();
+    init();
   }, []);
 
   // ── Handle query params from OAuth callback ──
@@ -385,7 +398,7 @@ export default function Home() {
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url.trim() }),
+        body: JSON.stringify({ url: url.trim(), voice: voiceId || undefined }),
       });
       const data = await res.json() as { jobId?: string; error?: string };
       if (!res.ok || !data.jobId) throw new Error(data.error || 'Lỗi khởi tạo job');
@@ -485,6 +498,34 @@ export default function Home() {
               )}
             </button>
           </div>
+
+          {/* Voice picker */}
+          {voices.length > 0 && (
+            <div className="mt-4 flex items-center gap-2 flex-wrap">
+              <span className="text-[#6b7280] text-xs">Giọng đọc:</span>
+              {voices.map((v) => {
+                const selected = v.id === voiceId;
+                const icon = v.gender === 'female' ? '👩' : v.gender === 'male' ? '👨' : '🌐';
+                return (
+                  <button
+                    key={v.id}
+                    type="button"
+                    onClick={() => setVoiceId(v.id)}
+                    disabled={isGenerating}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all
+                      ${selected
+                        ? 'bg-[#ff4757]/15 border-[#ff4757]/60 text-white'
+                        : 'bg-[#0a0a0f] border-[#1e1e2e] text-[#a0a0b0] hover:border-[#ff4757]/30 hover:text-white'
+                      }
+                      ${isGenerating ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    <span>{icon}</span>
+                    <span>{v.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
           {/* Quick example */}
           <p className="text-[#3a3a4a] text-xs mt-3">
