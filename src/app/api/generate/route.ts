@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import fs from 'fs';
 import { createJob, updateJob, advanceStep, pruneOldJobs } from '@/lib/jobs';
-import { crawlArticle, downloadImage } from '@/lib/crawler';
+import { crawlArticle, downloadImages } from '@/lib/crawler';
 import { generateScript } from '@/lib/script';
 import { generateAudio, sanitizeScript } from '@/lib/tts';
 import { generateSRT, generateASS } from '@/lib/subtitle';
@@ -16,12 +16,12 @@ async function processPipeline(jobId: string, url: string) {
   const outDir = path.join(process.cwd(), 'outputs', jobId);
 
   try {
-    // Step 1: Crawl + download ảnh hero (song song với các step sau)
+    // Step 1: Crawl + download ảnh (song song với các step sau)
     advanceStep(jobId, 'crawling', { step: 'Đang đọc bài báo...', progress: 10 });
     const article = await crawlArticle(url);
-    const imageDownload = article.imageUrl
-      ? downloadImage(article.imageUrl, outDir)
-      : Promise.resolve(undefined);
+    const imageDownload = article.imageUrls.length > 0
+      ? downloadImages(article.imageUrls, outDir)
+      : Promise.resolve([] as string[]);
 
     // Step 2: Generate script. Clean labels (**HOOK**:, ...) ngay sau khi
     // LLM trả về để tất cả các step sau (TTS, subtitle, UI) dùng cùng 1 text.
@@ -51,13 +51,14 @@ async function processPipeline(jobId: string, url: string) {
     // Step 5: Render video (hard-clamp về đúng duration audio)
     advanceStep(jobId, 'video', { step: 'Đang render video...', progress: 75 });
     const videoPath = path.join(outDir, 'video.mp4');
-    const imagePath = await imageDownload;
+    const imagePaths = await imageDownload;
+    console.log(`[pipeline] Render với ${imagePaths.length} ảnh`);
     await renderVideo({
       audioPath,
       assPath,
       outputPath: videoPath,
       duration,
-      imagePath,
+      imagePaths,
     });
     updateJob(jobId, { videoPath });
 

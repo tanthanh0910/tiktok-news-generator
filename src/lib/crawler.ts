@@ -7,7 +7,7 @@ export interface CrawlResult {
   title: string;
   content: string;
   source: string;
-  imageUrl?: string;
+  imageUrls: string[];
 }
 
 // Danh sách các domain bị chặn CORS hoặc cần User-Agent đặc biệt
@@ -79,25 +79,39 @@ export async function crawlArticle(url: string): Promise<CrawlResult> {
     $('title').text() ||
     'Bài báo';
 
-  // Lấy ảnh hero theo thứ tự ưu tiên: og:image → twitter:image → ảnh đầu
-  // tiên trong article body. Resolve relative URL nếu cần.
-  let imageUrl =
-    $('meta[property="og:image"]').attr('content') ||
-    $('meta[name="twitter:image"]').attr('content') ||
-    $('meta[property="og:image:secure_url"]').attr('content') ||
-    $('article img').first().attr('src') ||
-    $('main img').first().attr('src') ||
-    undefined;
+  // Thu thập ảnh để slideshow: og:image, twitter:image rồi tất cả <img>
+  // trong article body / main. Filter http(s), dedupe, limit 8 ảnh đầu.
+  const candidates: string[] = [];
+  const og = $('meta[property="og:image"]').attr('content');
+  const twit = $('meta[name="twitter:image"]').attr('content');
+  if (og) candidates.push(og);
+  if (twit) candidates.push(twit);
 
-  if (imageUrl) {
+  $('article img, main img, [itemprop="articleBody"] img, .detail-content img, .article-body img, .article__body img')
+    .each((_, el) => {
+      const src = $(el).attr('src') || $(el).attr('data-src') || $(el).attr('data-original');
+      if (src) candidates.push(src);
+    });
+
+  const seen = new Set<string>();
+  const imageUrls: string[] = [];
+  for (const raw of candidates) {
+    let abs: string;
     try {
-      imageUrl = new URL(imageUrl, parsed.origin).toString();
+      abs = new URL(raw, parsed.origin).toString();
     } catch {
-      imageUrl = undefined;
+      continue;
     }
+    if (!/^https?:/.test(abs)) continue;
+    // Bỏ icon, logo, sprite, base64 (đã loại ở trên), gif động nhỏ
+    if (/\b(logo|icon|sprite|avatar|emoji|favicon|placeholder)\b/i.test(abs)) continue;
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    imageUrls.push(abs);
+    if (imageUrls.length >= 8) break;
   }
 
-  // Sanitize and limit content length (don't send >8000 chars to OpenAI)
+  // Sanitize and limit content length (don't send >8000 chars to LLM)
   const sanitized = content
     .replace(/\s+/g, ' ')
     .replace(/[\r\n]+/g, '\n')
@@ -108,37 +122,44 @@ export async function crawlArticle(url: string): Promise<CrawlResult> {
     title: title.trim(),
     content: sanitized,
     source: parsed.hostname,
-    imageUrl,
+    imageUrls,
   };
 }
 
 /**
- * Tải ảnh về đĩa. Trả về đường dẫn local nếu thành công, undefined nếu fail.
- * Không throw để pipeline luôn chạy tiếp được.
+ * Tải 1 ảnh về đĩa. Trả về đường dẫn local nếu thành công, undefined nếu fail.
  */
-export async function downloadImage(url: string, outputDir: string): Promise<string | undefined> {
+async function downloadOne(url: string, outputPath: string): Promise<string | undefined> {
   try {
     const res = await axios.get<ArrayBuffer>(url, {
       headers: { 'User-Agent': HEADERS['User-Agent'] },
       responseType: 'arraybuffer',
       timeout: 15_000,
-      maxContentLength: 20 * 1024 * 1024, // 20MB max
+      maxContentLength: 20 * 1024 * 1024,
     });
-
-    const contentType = String(res.headers['content-type'] || '').toLowerCase();
-    const ext =
-      contentType.includes('png') ? 'png'
-      : contentType.includes('webp') ? 'webp'
-      : contentType.includes('gif') ? 'gif'
-      : 'jpg';
-
-    const outputPath = path.join(outputDir, `hero.${ext}`);
-    fs.mkdirSync(outputDir, { recursive: true });
+    // Bỏ ảnh quá nhỏ (likely là icon/avatar lọt qua filter)
+    if (res.data.byteLength < 10_000) return undefined;
     fs.writeFileSync(outputPath, Buffer.from(res.data));
     return outputPath;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.warn('[crawler] downloadImage fail:', msg);
+    console.warn(`[crawler] downloadOne fail (${url.slice(0, 60)}...):`, msg);
     return undefined;
   }
+}
+
+/**
+ * Download song song nhiều ảnh. Trả về list path đã download thành công
+ * (giữ thứ tự, bỏ qua ảnh fail). Limit MAX_IMAGES để render không quá lâu.
+ */
+export async function downloadImages(urls: string[], outputDir: string): Promise<string[]> {
+  const MAX_IMAGES = 6;
+  const limited = urls.slice(0, MAX_IMAGES);
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  // ffmpeg đọc được jpg/png/webp; đặt extension chung là .img để đơn giản
+  const results = await Promise.all(
+    limited.map((url, i) => downloadOne(url, path.join(outputDir, `hero${i}.img`)))
+  );
+  return results.filter((p): p is string => !!p);
 }

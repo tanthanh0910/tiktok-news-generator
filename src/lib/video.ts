@@ -48,23 +48,22 @@ export function getAudioDuration(audioPath: string): Promise<number> {
 }
 
 /**
- * Render video TikTok dọc (1080×1920) với:
- *  - Gradient background tối (dark blue)
- *  - Thanh accent đỏ trên cùng
- *  - Label "TIN TỨC NÓNG" ở trên
+ * Render video TikTok dọc (1080×1920):
+ *  - 0 ảnh: gradient navy fallback
+ *  - 1 ảnh: blur backdrop + Ken Burns foreground (slow zoom in)
+ *  - 2+ ảnh: slideshow với 4 motion preset luân phiên + xfade 0.5s giữa các ảnh
  *  - Subtitle burn-in từ file ASS ở dưới
- *  - Audio từ file MP3
+ *  - Audio từ file MP3 hard-clamp về đúng duration
  */
 export function renderVideo(params: {
   audioPath: string;
   assPath: string;
   outputPath: string;
-  /** Độ dài audio (giây). Dùng để hard-clamp video kết thúc đúng lúc voice xong. */
   duration: number;
-  /** Đường dẫn ảnh nền (hero của bài báo). Nếu có sẽ dùng làm background blur + Ken Burns foreground. */
-  imagePath?: string;
+  /** Đường dẫn ảnh local (đã download). Nếu rỗng → fallback gradient. */
+  imagePaths?: string[];
 }): Promise<void> {
-  const { audioPath, assPath, outputPath, duration, imagePath } = params;
+  const { audioPath, assPath, outputPath, duration, imagePaths = [] } = params;
 
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -76,86 +75,96 @@ export function renderVideo(params: {
 
   const escapePath = (p: string) =>
     p.replace(/\\/g, '/').replace(/:/g, '\\:').replace(/'/g, "\\'");
-
   const assEscaped = escapePath(assPath);
 
-  const useImage = !!imagePath && fs.existsSync(imagePath);
+  const validImages = imagePaths.filter((p) => p && fs.existsSync(p));
   const FPS = 24;
-  const totalFrames = Math.max(1, Math.ceil(duration * FPS));
-
-  // ─── Build filter graph ───
-  // 2 case: có ảnh hero → blur backdrop + Ken Burns foreground
-  //         không có ảnh → gradient navy như cũ
-  type Filter = string | { filter: string; options: Record<string, unknown>; inputs: string | string[]; outputs: string };
-  const filters: Filter[] = [];
-
-  if (useImage) {
-    // Backdrop: scale fit-cover 1080x1920, blur mạnh, tối đi 40%, bão hoà giảm
-    filters.push(
-      '[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:2,eq=brightness=-0.3:saturation=0.6,setsar=1[bg]'
-    );
-    // Foreground: ảnh gốc fit theo width 1080, zoom chậm Ken Burns 1.0 → 1.15
-    // zoompan output là 1080x1080 (vuông), đặt y=420 (dưới label "TIN MOI") để chừa chỗ subtitle
-    filters.push(
-      `[0:v]scale=2000:-1,zoompan=z='1+0.15*on/${totalFrames}':d=${totalFrames}:s=1080x1080:fps=${FPS},setsar=1[fg]`
-    );
-    filters.push('[bg][fg]overlay=x=0:y=420[base]');
-  } else {
-    // Fallback: gradient nếu không có ảnh
-    filters.push({
-      filter: 'geq',
-      options: {
-        r: '13+10*(Y/1920)',
-        g: '17+22*(Y/1920)',
-        b: '23+45*(Y/1920)',
-      },
-      inputs: '0:v',
-      outputs: 'base',
-    });
-  }
-
-  // Subtitle burn-in (không còn thanh đỏ + label trên header)
-  filters.push({
-    filter: 'subtitles',
-    options: { filename: assEscaped, fontsdir: escapePath(fontDir) },
-    inputs: 'base',
-    outputs: 'v',
-  });
 
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg();
+    const filterParts: string[] = [];
 
-    if (useImage) {
-      // Input 0: ảnh hero (loop để thành video stream)
-      cmd.input(imagePath!).inputOptions(['-loop', '1', '-framerate', String(FPS)]);
-    } else {
-      // Input 0: nullsrc (gradient sẽ được tạo bởi geq)
+    if (validImages.length === 0) {
+      // ─ Case 0 ảnh: gradient fallback ─
       cmd.input(`nullsrc=s=1080x1920:r=${FPS}`).inputOptions(['-f', 'lavfi']);
+      filterParts.push(
+        '[0:v]geq=r=\'13+10*(Y/1920)\':g=\'17+22*(Y/1920)\':b=\'23+45*(Y/1920)\'[base]'
+      );
+    } else {
+      // ─ Case 1+ ảnh: dùng image input(s), build slideshow nếu nhiều hơn 1 ─
+      const N = validImages.length;
+      const XF = N >= 2 ? 0.5 : 0;
+      // Mỗi ảnh chiếm: (duration + XF*(N-1)) / N giây để tổng (sau xfade) đúng = duration
+      const PER = (duration + XF * (N - 1)) / N;
+      const PER_FRAMES = Math.max(1, Math.ceil(PER * FPS));
+      // Thêm chút buffer (+0.3s) cho mỗi input để xfade không bị chạm boundary
+      const INPUT_LEN = PER + 0.3;
+
+      // Add inputs
+      for (const p of validImages) {
+        cmd.input(p).inputOptions(['-loop', '1', '-framerate', String(FPS), '-t', INPUT_LEN.toFixed(3)]);
+      }
+
+      // Build per-image scene (backdrop blur + foreground Ken Burns overlay)
+      for (let i = 0; i < N; i++) {
+        // Backdrop: blur fit-cover full 1080x1920
+        filterParts.push(
+          `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:2,eq=brightness=-0.3:saturation=0.6,setsar=1,trim=duration=${INPUT_LEN.toFixed(3)},setpts=PTS-STARTPTS[bg${i}]`
+        );
+
+        // Foreground: 1 trong 4 motion preset (luân phiên theo i)
+        const motion = kenBurnsExpr(i, PER_FRAMES, FPS);
+        filterParts.push(
+          `[${i}:v]scale=2000:-1,${motion},setsar=1,trim=duration=${INPUT_LEN.toFixed(3)},setpts=PTS-STARTPTS[fg${i}]`
+        );
+
+        // Compose: backdrop + foreground
+        filterParts.push(`[bg${i}][fg${i}]overlay=x=0:y=420[scene${i}]`);
+      }
+
+      if (N === 1) {
+        filterParts.push(`[scene0]copy[base]`);
+      } else {
+        // Chain xfade transitions
+        let prev = 'scene0';
+        let cumOffset = PER - XF;
+        for (let i = 1; i < N; i++) {
+          const out = i === N - 1 ? 'base' : `xf${i}`;
+          filterParts.push(
+            `[${prev}][scene${i}]xfade=transition=fade:duration=${XF}:offset=${cumOffset.toFixed(3)}[${out}]`
+          );
+          prev = out;
+          cumOffset += PER - XF;
+        }
+      }
     }
-    // Input 1: audio
+
+    // Subtitle burn-in
+    filterParts.push(
+      `[base]subtitles=filename=${assEscaped}:fontsdir=${escapePath(fontDir)}[v]`
+    );
+
+    // Audio input (luôn là input cuối cùng)
+    const audioIdx = validImages.length === 0 ? 1 : validImages.length;
     cmd.input(audioPath);
 
     cmd
-      .complexFilter(filters)
+      .complexFilter(filterParts.join(';'))
       .outputOptions([
-        '-map [v]',
-        '-map 1:a',
-        '-c:v libx264',
-        '-preset fast',
-        '-crf 23',
-        '-c:a aac',
-        '-b:a 192k',
-        // Hard-clamp output về đúng duration audio. Bảo hiểm trường hợp
-        // -shortest không cắt được do nullsrc là infinite stream.
+        '-map', '[v]',
+        '-map', `${audioIdx}:a`,
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '23',
+        '-c:a', 'aac',
+        '-b:a', '192k',
         '-t', duration.toFixed(3),
-        '-pix_fmt yuv420p',   // Tương thích rộng
-        '-movflags +faststart', // Streaming-friendly
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
       ])
       .output(outputPath)
-      .on('start', (cmd) => console.log('[ffmpeg] Start:', cmd))
+      .on('start', (c) => console.log('[ffmpeg] Start:', c.slice(0, 200) + '...'))
       .on('progress', (p) => {
-        // lavfi nullsrc là infinite input → ffmpeg không tính được percent.
-        // Chỉ log khi có giá trị thật để tránh spam "undefined%".
         if (typeof p.percent === 'number' && !isNaN(p.percent)) {
           console.log(`[ffmpeg] ${p.percent.toFixed(1)}%`);
         }
@@ -164,6 +173,25 @@ export function renderVideo(params: {
       .on('error', (err) => reject(new Error(`ffmpeg error: ${err.message}`)))
       .run();
   });
+}
+
+/**
+ * Sinh expression cho zoompan filter — luân phiên 4 kiểu motion theo index để
+ * mỗi ảnh có "góc máy" khác nhau. Output luôn là 1080x1080 ở FPS đã cho.
+ */
+function kenBurnsExpr(idx: number, frames: number, fps: number): string {
+  const f = frames;
+  const presets = [
+    // Zoom in chậm: 1.0 → 1.25
+    `zoompan=z='min(1.25,1+0.25*on/${f})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
+    // Zoom out: 1.25 → 1.0
+    `zoompan=z='max(1.0,1.25-0.25*on/${f})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
+    // Pan trái → phải, zoom nhẹ 1.15
+    `zoompan=z=1.15:x='iw*0.15+iw*0.15*on/${f} - (iw/zoom/2)*0+iw*0.15*on/${f}':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
+    // Pan phải → trái, zoom nhẹ 1.15
+    `zoompan=z=1.15:x='iw*0.45-iw*0.15*on/${f}':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
+  ];
+  return presets[idx % presets.length];
 }
 
 /**
