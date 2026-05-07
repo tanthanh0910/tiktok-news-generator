@@ -1,13 +1,12 @@
 import { NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
-import fs from 'fs';
 import { createJob, updateJob, advanceStep, pruneOldJobs } from '@/lib/jobs';
 import { crawlArticle, downloadImages } from '@/lib/crawler';
-import { generateScript } from '@/lib/script';
+import { generateScript, generateHashtags } from '@/lib/script';
 import { generateAudio, sanitizeScript } from '@/lib/tts';
 import { generateSRT, generateASS } from '@/lib/subtitle';
-import { renderVideo, trimAudioSilence } from '@/lib/video';
+import { renderVideo, trimAudioSilence, downloadVideos } from '@/lib/video';
 
 export const maxDuration = 300; // 5 phút cho route này
 
@@ -16,11 +15,14 @@ async function processPipeline(jobId: string, url: string, voiceId?: string) {
   const outDir = path.join(process.cwd(), 'outputs', jobId);
 
   try {
-    // Step 1: Crawl + download ảnh (song song với các step sau)
+    // Step 1: Crawl + download ảnh & video (song song với các step sau)
     advanceStep(jobId, 'crawling', { step: 'Đang đọc bài báo...', progress: 10 });
     const article = await crawlArticle(url);
     const imageDownload = article.imageUrls.length > 0
       ? downloadImages(article.imageUrls, outDir)
+      : Promise.resolve([] as string[]);
+    const videoDownload = article.videoUrls.length > 0
+      ? downloadVideos(article.videoUrls, outDir)
       : Promise.resolve([] as string[]);
 
     // Step 2: Generate script. Clean labels (**HOOK**:, ...) ngay sau khi
@@ -29,6 +31,13 @@ async function processPipeline(jobId: string, url: string, voiceId?: string) {
     const rawScript = await generateScript(article);
     const script = sanitizeScript(rawScript);
     updateJob(jobId, { script });
+
+    // Hashtag generation chạy song song với TTS – cả 2 chỉ cần script.
+    // Hashtag fail không chặn pipeline (video vẫn render được, chỉ thiếu hashtag).
+    const hashtagsPromise = generateHashtags(article, script).catch((err) => {
+      console.warn('[hashtags] generate fail:', err instanceof Error ? err.message : err);
+      return [] as string[];
+    });
 
     // Step 3: TTS
     advanceStep(jobId, 'tts', { step: 'Đang tạo giọng đọc...', progress: 45 });
@@ -51,16 +60,21 @@ async function processPipeline(jobId: string, url: string, voiceId?: string) {
     // Step 5: Render video (hard-clamp về đúng duration audio)
     advanceStep(jobId, 'video', { step: 'Đang render video...', progress: 75 });
     const videoPath = path.join(outDir, 'video.mp4');
-    const imagePaths = await imageDownload;
-    console.log(`[pipeline] Render với ${imagePaths.length} ảnh`);
+    const [imagePaths, videoSrcPaths] = await Promise.all([imageDownload, videoDownload]);
+    console.log(`[pipeline] Render với ${imagePaths.length} ảnh, ${videoSrcPaths.length} video`);
     await renderVideo({
       audioPath,
       assPath,
       outputPath: videoPath,
       duration,
       imagePaths,
+      videoPaths: videoSrcPaths,
     });
     updateJob(jobId, { videoPath });
+
+    // Chờ hashtag generation xong (thường đã xong rồi vì chạy parallel với TTS).
+    const hashtags = await hashtagsPromise;
+    updateJob(jobId, { hashtags });
 
     advanceStep(jobId, 'done', { step: 'Hoàn thành!', progress: 100 });
   } catch (err) {

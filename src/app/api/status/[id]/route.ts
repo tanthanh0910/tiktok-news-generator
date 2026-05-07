@@ -16,6 +16,7 @@ export async function GET(
     step: job.step,
     progress: job.progress,
     script: job.script,
+    hashtags: job.hashtags,
     audioDuration: job.audioDuration,
     error: job.error,
     createdAt: job.createdAt,

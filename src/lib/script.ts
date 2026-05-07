@@ -51,3 +51,62 @@ export async function generateScript(article: CrawlResult): Promise<string> {
 
   return script;
 }
+
+const HASHTAG_PROMPT = `Bạn là chuyên gia SEO TikTok tiếng Việt. Sinh hashtag cho video tin tức.
+
+Yêu cầu:
+- Đúng 5 hashtag, mỗi hashtag bắt đầu bằng dấu #
+- 3 hashtag đầu: chủ đề chính của bài (tên người/địa danh/sự kiện/lĩnh vực)
+  + Không có dấu cách trong hashtag (ví dụ: #QuangNgai, không phải #Quang Ngai)
+  + Không có dấu trong hashtag (ví dụ: #QuangNgai không phải #QuảngNgãi)
+- 2 hashtag cuối: chọn từ danh sách trending - #xuhuong #tintuc #fyp #viral #vietnam
+- Tất cả 5 hashtag trên 1 dòng duy nhất, cách nhau bằng dấu cách
+- KHÔNG markdown, KHÔNG giải thích, KHÔNG đánh số
+
+Ví dụ output đúng: #QuangNgai #QuyHoach #BatDongSan #xuhuong #tintuc`;
+
+/**
+ * Gọi Ollama lần 2 sinh hashtag dựa vào title + content + script.
+ * Trả về list 5 hashtag (đã chuẩn hóa, có dấu # phía trước).
+ */
+export async function generateHashtags(
+  article: CrawlResult,
+  script: string
+): Promise<string[]> {
+  const userMessage =
+    `Tiêu đề: ${article.title}\n` +
+    `Nguồn: ${article.source}\n\n` +
+    `Tóm tắt nội dung:\n${article.content.slice(0, 1500)}\n\n` +
+    `Script video:\n${script}`;
+
+  const completion = await getClient().chat.completions.create({
+    model: MODEL,
+    messages: [
+      { role: 'system', content: HASHTAG_PROMPT },
+      { role: 'user', content: userMessage },
+    ],
+    temperature: 0.5,
+    max_tokens: 200,
+  });
+
+  const raw = completion.choices[0]?.message?.content?.trim() ?? '';
+
+  // Parse hashtag bằng regex đơn giản. Vietnamese chars vẫn match được vì
+  // [^\s#] không loại unicode.
+  const matches = raw.match(/#[^\s#]+/g) ?? [];
+
+  // Dedupe + lowercase trending tags để consistency
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const trending = new Set(['#xuhuong', '#tintuc', '#fyp', '#viral', '#vietnam', '#foryou']);
+  for (const tag of matches) {
+    const normalized = trending.has(tag.toLowerCase()) ? tag.toLowerCase() : tag;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+    if (out.length >= 5) break;
+  }
+
+  return out;
+}

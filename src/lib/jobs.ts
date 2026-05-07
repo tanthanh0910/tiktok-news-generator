@@ -27,6 +27,7 @@ export interface Job {
   progress: number;
   url: string;
   script?: string;
+  hashtags?: string[];
   audioPath?: string;
   srtPath?: string;
   videoPath?: string;

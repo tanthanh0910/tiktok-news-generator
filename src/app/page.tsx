@@ -28,6 +28,7 @@ interface JobState {
   step: string;
   progress: number;
   script?: string;
+  hashtags?: string[];
   audioDuration?: number;
   error?: string;
   createdAt?: number;
@@ -291,6 +292,52 @@ function UploadPanel({
           <span className="text-[#6b7280] text-sm">TikTok chưa kết nối</span>
         )}
         {ttError && <span className="text-red-400 text-xs">{ttError}</span>}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Hashtags panel — pill buttons + copy individual / copy all
+// ─────────────────────────────────────────────
+function HashtagsPanel({ hashtags }: { hashtags: string[] }) {
+  const [copiedIdx, setCopiedIdx] = useState<number | 'all' | null>(null);
+
+  const copy = async (text: string, idx: number | 'all') => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx(null), 1500);
+    } catch {/* clipboard blocked */}
+  };
+
+  const all = hashtags.join(' ');
+
+  return (
+    <div className="bg-[#111118] border border-[#1e1e2e] rounded-2xl p-6 space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-white font-semibold">Hashtag</h3>
+        <button
+          onClick={() => copy(all, 'all')}
+          className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-[#1e1e2e] hover:bg-[#2e2e3e] text-[#a0a0b0] hover:text-white transition-colors"
+        >
+          {copiedIdx === 'all' ? '✓ Đã copy' : '⧉ Copy tất cả'}
+        </button>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {hashtags.map((tag, i) => (
+          <button
+            key={i}
+            onClick={() => copy(tag, i)}
+            className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-all
+              ${copiedIdx === i
+                ? 'bg-green-900/30 border-green-700/40 text-green-400'
+                : 'bg-[#0a0a0f] border-[#1e1e2e] text-[#ff4757] hover:border-[#ff4757]/40'
+              }`}
+          >
+            {copiedIdx === i ? `✓ ${tag}` : tag}
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -656,6 +703,11 @@ export default function Home() {
               readOnly
             />
           </div>
+        )}
+
+        {/* Hashtags */}
+        {job?.hashtags && job.hashtags.length > 0 && (
+          <HashtagsPanel hashtags={job.hashtags} />
         )}
 
         {/* Download + Video preview */}

@@ -55,20 +55,21 @@ export function getAudioDuration(audioPath: string): Promise<number> {
  *  - Subtitle burn-in từ file ASS ở dưới
  *  - Audio từ file MP3 hard-clamp về đúng duration
  */
-export function renderVideo(params: {
+export async function renderVideo(params: {
   audioPath: string;
   assPath: string;
   outputPath: string;
   duration: number;
   /** Đường dẫn ảnh local (đã download). Nếu rỗng → fallback gradient. */
   imagePaths?: string[];
+  /** Danh sách video local đã download (mp4). Sẽ ghép theo thứ tự, hard cut. */
+  videoPaths?: string[];
 }): Promise<void> {
-  const { audioPath, assPath, outputPath, duration, imagePaths = [] } = params;
+  const { audioPath, assPath, outputPath, duration, imagePaths = [], videoPaths = [] } = params;
 
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  // Font dir cho filter subtitles (để libass tìm font hỗ trợ tiếng Việt)
   const macFont = '/System/Library/Fonts/Supplemental/Arial Unicode MS.ttf';
   const fallbackFont = '/System/Library/Fonts/Helvetica.ttc';
   const fontDir = path.dirname(fs.existsSync(macFont) ? macFont : fallbackFont);
@@ -78,63 +79,164 @@ export function renderVideo(params: {
   const assEscaped = escapePath(assPath);
 
   const validImages = imagePaths.filter((p) => p && fs.existsSync(p));
+  const validVideos = videoPaths.filter((p) => p && fs.existsSync(p));
   const FPS = 24;
+  const PER = 2.5;
+  const XF_DEFAULT = 0.3;
+
+  // Đo duration từng video. Bỏ video không đọc được.
+  type VideoClip = { path: string; dur: number };
+  const videoClips: VideoClip[] = [];
+  for (const p of validVideos) {
+    const d = await getAudioDuration(p).catch(() => 0);
+    if (d > 0.5) videoClips.push({ path: p, dur: d });
+  }
+
+  // Tổng video time available (cap mỗi clip cuối nếu vượt audio).
+  // Nếu không đủ AND không có ảnh → loop video list.
+  const rawTotalVideo = videoClips.reduce((s, c) => s + c.dur, 0);
+
+  // Build segment list: mỗi segment = { kind: 'video', path, dur } hoặc { kind: 'slideshow' }
+  type Segment =
+    | { kind: 'video'; path: string; dur: number }
+    | { kind: 'slideshow'; dur: number };
+
+  const segments: Segment[] = [];
+
+  if (videoClips.length > 0 && rawTotalVideo >= duration - 0.1) {
+    // Video đủ cover hết audio → chỉ dùng video, cut clip cuối nếu vượt.
+    let remain = duration;
+    for (const c of videoClips) {
+      if (remain <= 0.1) break;
+      const useDur = Math.min(c.dur, remain);
+      segments.push({ kind: 'video', path: c.path, dur: useDur });
+      remain -= useDur;
+    }
+  } else if (videoClips.length > 0 && validImages.length > 0) {
+    // Có video + có ảnh: dùng hết video → slideshow phần còn lại
+    for (const c of videoClips) {
+      segments.push({ kind: 'video', path: c.path, dur: c.dur });
+    }
+    const slideshowDur = duration - rawTotalVideo + XF_DEFAULT; // +XF cho overlap xfade
+    segments.push({ kind: 'slideshow', dur: slideshowDur });
+  } else if (videoClips.length > 0) {
+    // Chỉ có video, không đủ duration, không có ảnh → loop video list
+    let remain = duration;
+    let i = 0;
+    while (remain > 0.1) {
+      const c = videoClips[i % videoClips.length];
+      const useDur = Math.min(c.dur, remain);
+      segments.push({ kind: 'video', path: c.path, dur: useDur });
+      remain -= useDur;
+      i++;
+    }
+  } else if (validImages.length > 0) {
+    // Chỉ có ảnh
+    segments.push({ kind: 'slideshow', dur: duration });
+  }
+  // else: gradient fallback (xử lý dưới)
 
   return new Promise((resolve, reject) => {
     const cmd = ffmpeg();
     const filterParts: string[] = [];
+    let inputCount = 0;
 
-    if (validImages.length === 0) {
-      // ─ Case 0 ảnh: gradient fallback ─
+    if (segments.length === 0) {
+      // ─ Case không có gì: gradient fallback ─
       cmd.input(`nullsrc=s=1080x1920:r=${FPS}`).inputOptions(['-f', 'lavfi']);
+      inputCount = 1;
       filterParts.push(
         '[0:v]geq=r=\'13+10*(Y/1920)\':g=\'17+22*(Y/1920)\':b=\'23+45*(Y/1920)\'[base]'
       );
     } else {
-      // ─ Case 1+ ảnh: dùng image input(s), build slideshow nếu nhiều hơn 1 ─
-      const N = validImages.length;
-      const XF = N >= 2 ? 0.5 : 0;
-      // Mỗi ảnh chiếm: (duration + XF*(N-1)) / N giây để tổng (sau xfade) đúng = duration
-      const PER = (duration + XF * (N - 1)) / N;
-      const PER_FRAMES = Math.max(1, Math.ceil(PER * FPS));
-      // Thêm chút buffer (+0.3s) cho mỗi input để xfade không bị chạm boundary
-      const INPUT_LEN = PER + 0.3;
+      // Mỗi segment → 1 stream output [seg{k}]
+      // Hard cut giữa các video, xfade chỉ ở video → slideshow.
+      const segOutLabels: string[] = [];
 
-      // Add inputs
-      for (const p of validImages) {
-        cmd.input(p).inputOptions(['-loop', '1', '-framerate', String(FPS), '-t', INPUT_LEN.toFixed(3)]);
-      }
-
-      // Build per-image scene (backdrop blur + foreground Ken Burns overlay)
-      for (let i = 0; i < N; i++) {
-        // Backdrop: blur fit-cover full 1080x1920
-        filterParts.push(
-          `[${i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=30:2,eq=brightness=-0.3:saturation=0.6,setsar=1,trim=duration=${INPUT_LEN.toFixed(3)},setpts=PTS-STARTPTS[bg${i}]`
-        );
-
-        // Foreground: 1 trong 4 motion preset (luân phiên theo i)
-        const motion = kenBurnsExpr(i, PER_FRAMES, FPS);
-        filterParts.push(
-          `[${i}:v]scale=2000:-1,${motion},setsar=1,trim=duration=${INPUT_LEN.toFixed(3)},setpts=PTS-STARTPTS[fg${i}]`
-        );
-
-        // Compose: backdrop + foreground
-        filterParts.push(`[bg${i}][fg${i}]overlay=x=0:y=420[scene${i}]`);
-      }
-
-      if (N === 1) {
-        filterParts.push(`[scene0]copy[base]`);
-      } else {
-        // Chain xfade transitions
-        let prev = 'scene0';
-        let cumOffset = PER - XF;
-        for (let i = 1; i < N; i++) {
-          const out = i === N - 1 ? 'base' : `xf${i}`;
+      for (let k = 0; k < segments.length; k++) {
+        const seg = segments[k];
+        if (seg.kind === 'video') {
+          const inIdx = inputCount;
+          cmd.input(seg.path);
+          inputCount++;
           filterParts.push(
-            `[${prev}][scene${i}]xfade=transition=fade:duration=${XF}:offset=${cumOffset.toFixed(3)}[${out}]`
+            `[${inIdx}:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,` +
+            `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=${FPS},settb=AVTB,` +
+            `trim=duration=${seg.dur.toFixed(3)},setpts=PTS-STARTPTS[seg${k}]`
           );
+          segOutLabels.push(`seg${k}`);
+        } else {
+          // Slideshow segment → build sub-graph với scenes + xfade nội bộ
+          const slideshowDur = seg.dur;
+          const enoughForSceneXf = slideshowDur > PER + 0.5;
+          const XF = enoughForSceneXf ? XF_DEFAULT : 0;
+          const nScenes = enoughForSceneXf
+            ? Math.max(1, Math.ceil((slideshowDur - XF) / (PER - XF)))
+            : 1;
+          const PER_FRAMES = Math.max(1, Math.ceil(PER * FPS));
+          const SCENE_INPUT_LEN = PER + 0.3;
+          const uniqueN = validImages.length;
+          const sceneStart = inputCount;
+
+          for (let i = 0; i < nScenes; i++) {
+            const imgPath = validImages[i % uniqueN];
+            cmd.input(imgPath).inputOptions(['-loop', '1', '-framerate', String(FPS), '-t', SCENE_INPUT_LEN.toFixed(3)]);
+            inputCount++;
+          }
+
+          for (let i = 0; i < nScenes; i++) {
+            const motion = kenBurnsExpr(i, PER_FRAMES, FPS);
+            filterParts.push(
+              `[${sceneStart + i}:v]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos,` +
+              `pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1,${motion},settb=AVTB,` +
+              `trim=duration=${SCENE_INPUT_LEN.toFixed(3)},setpts=PTS-STARTPTS[scn${k}_${i}]`
+            );
+          }
+
+          if (nScenes === 1) {
+            filterParts.push(`[scn${k}_0]copy[seg${k}]`);
+          } else {
+            let prev = `scn${k}_0`;
+            let cumOffset = PER - XF;
+            for (let i = 1; i < nScenes; i++) {
+              const out = i === nScenes - 1 ? `seg${k}` : `xfk${k}_${i}`;
+              filterParts.push(
+                `[${prev}][scn${k}_${i}]xfade=transition=fade:duration=${XF}:offset=${cumOffset.toFixed(3)}[${out}]`
+              );
+              prev = out;
+              cumOffset += PER - XF;
+            }
+          }
+          segOutLabels.push(`seg${k}`);
+        }
+      }
+
+      // Chain segments lại: hard cut giữa video-video, xfade ở video→slideshow
+      if (segOutLabels.length === 1) {
+        filterParts.push(`[${segOutLabels[0]}]copy[base]`);
+      } else {
+        let prev = segOutLabels[0];
+        let cumOffset = segments[0].dur;
+        for (let k = 1; k < segOutLabels.length; k++) {
+          const seg = segments[k];
+          const prevSeg = segments[k - 1];
+          const out = k === segOutLabels.length - 1 ? 'base' : `chain${k}`;
+          // Xfade chỉ khi đoạn trước là video VÀ đoạn này là slideshow.
+          const useXfade = prevSeg.kind === 'video' && seg.kind === 'slideshow';
+          if (useXfade) {
+            const offset = Math.max(0, cumOffset - XF_DEFAULT);
+            filterParts.push(
+              `[${prev}][${segOutLabels[k]}]xfade=transition=fade:duration=${XF_DEFAULT}:offset=${offset.toFixed(3)}[${out}]`
+            );
+            cumOffset += seg.dur - XF_DEFAULT;
+          } else {
+            // Hard cut: concat + settb để giữ timebase nhất quán cho xfade tiếp theo
+            filterParts.push(
+              `[${prev}][${segOutLabels[k]}]concat=n=2:v=1:a=0,settb=AVTB[${out}]`
+            );
+            cumOffset += seg.dur;
+          }
           prev = out;
-          cumOffset += PER - XF;
         }
       }
     }
@@ -145,7 +247,7 @@ export function renderVideo(params: {
     );
 
     // Audio input (luôn là input cuối cùng)
-    const audioIdx = validImages.length === 0 ? 1 : validImages.length;
+    const audioIdx = inputCount;
     cmd.input(audioPath);
 
     cmd
@@ -176,22 +278,89 @@ export function renderVideo(params: {
 }
 
 /**
- * Sinh expression cho zoompan filter — luân phiên 4 kiểu motion theo index để
- * mỗi ảnh có "góc máy" khác nhau. Output luôn là 1080x1080 ở FPS đã cho.
+ * Sinh expression cho zoompan filter — 4 motion preset luân phiên cho slideshow
+ * có "góc máy" khác nhau. Zoom nhẹ tối đa 1.05 để không vỡ hình. Output 1080×1920.
  */
 function kenBurnsExpr(idx: number, frames: number, fps: number): string {
   const f = frames;
+  const Z_MAX = 1.05;
+  const Z_MID = 1.03;
+  // Centered position cho zoom in/out (input đã được scale fit-cover ≥ 1080×1920)
+  const xCenter = `iw/2-(iw/zoom/2)`;
+  const yCenter = `ih/2-(ih/zoom/2)`;
   const presets = [
-    // Zoom in chậm: 1.0 → 1.25
-    `zoompan=z='min(1.25,1+0.25*on/${f})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
-    // Zoom out: 1.25 → 1.0
-    `zoompan=z='max(1.0,1.25-0.25*on/${f})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
-    // Pan trái → phải, zoom nhẹ 1.15
-    `zoompan=z=1.15:x='iw*0.15+iw*0.15*on/${f} - (iw/zoom/2)*0+iw*0.15*on/${f}':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
-    // Pan phải → trái, zoom nhẹ 1.15
-    `zoompan=z=1.15:x='iw*0.45-iw*0.15*on/${f}':y='ih/2-(ih/zoom/2)':d=${f}:s=1080x1080:fps=${fps}`,
+    // Zoom in: 1.0 → 1.05
+    `zoompan=z='min(${Z_MAX},1+0.05*on/${f})':x='${xCenter}':y='${yCenter}':d=${f}:s=1080x1920:fps=${fps}`,
+    // Zoom out: 1.05 → 1.0
+    `zoompan=z='max(1.0,${Z_MAX}-0.05*on/${f})':x='${xCenter}':y='${yCenter}':d=${f}:s=1080x1920:fps=${fps}`,
+    // Pan trái → phải với zoom nhẹ
+    `zoompan=z=${Z_MID}:x='(iw-iw/zoom)*on/${f}':y='${yCenter}':d=${f}:s=1080x1920:fps=${fps}`,
+    // Pan phải → trái với zoom nhẹ
+    `zoompan=z=${Z_MID}:x='(iw-iw/zoom)*(1-on/${f})':y='${yCenter}':d=${f}:s=1080x1920:fps=${fps}`,
   ];
   return presets[idx % presets.length];
+}
+
+/**
+ * Tải video từ URL (mp4 hoặc HLS m3u8) qua ffmpeg. Drop audio gốc, cap thời
+ * lượng để không tải quá lớn. Re-encode về h264/yuv420p để filter graph
+ * sau dùng được an toàn (m3u8 đôi khi codec lạ không mux được vào mp4).
+ * Trả về path nếu OK, undefined nếu fail.
+ */
+/**
+ * Tải nhiều video song song. Trả về list path đã download thành công
+ * (giữ thứ tự, bỏ url fail). Mỗi video cap maxDurationSec.
+ */
+export async function downloadVideos(
+  urls: string[],
+  outputDir: string,
+  maxDurationSec = 90
+): Promise<string[]> {
+  fs.mkdirSync(outputDir, { recursive: true });
+  const results = await Promise.all(
+    urls.slice(0, 3).map((url, i) =>
+      downloadVideo(url, path.join(outputDir, `clip${i}.mp4`), maxDurationSec)
+    )
+  );
+  return results.filter((p): p is string => !!p);
+}
+
+export function downloadVideo(
+  url: string,
+  outputPath: string,
+  maxDurationSec = 90
+): Promise<string | undefined> {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+  return new Promise((resolve) => {
+    ffmpeg(url)
+      .inputOptions([
+        '-user_agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124.0',
+        '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+      ])
+      .outputOptions([
+        '-t', String(maxDurationSec),
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', '24',
+        '-an', // bỏ audio gốc, dùng TTS
+        '-pix_fmt', 'yuv420p',
+        '-y',
+      ])
+      .output(outputPath)
+      .on('end', () => {
+        console.log(`[video-download] OK: ${outputPath}`);
+        resolve(outputPath);
+      })
+      .on('error', (err) => {
+        console.warn('[video-download] fail:', err.message);
+        if (fs.existsSync(outputPath)) {
+          try { fs.unlinkSync(outputPath); } catch {/* ignore */}
+        }
+        resolve(undefined);
+      })
+      .run();
+  });
 }
 
 /**
